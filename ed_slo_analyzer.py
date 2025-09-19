@@ -6,7 +6,7 @@ This tool analyzes Ed Discussion JSON data to compute Service Level Objectives (
 for answering student questions.
 
 Author:
-    Alex Jiakai Xu <ax2155@columbia.edu>
+    Alex Jiakai Xu <jiakai.xu@columbia.edu>
 
 Usage:
     python ed_slo_analyzer.py <json_file> [options]
