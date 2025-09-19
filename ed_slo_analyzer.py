@@ -7,10 +7,11 @@ for answering student questions.
 
 Usage:
     python ed_slo_analyzer.py <json_file> [options]
-    
+
 Options:
     --mode {details|week|overall}  Analysis mode (default: overall)
     --categorize                   Show breakdown by category, only for week and overall modes
+    --count-unconfirmed           Count unconfirmed student answers as resolved (default: False)
     --help                        Show this help message
 """
 
@@ -21,6 +22,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from statistics import mean, median
+from enum import Enum
+
+
+class ThreadStatus(Enum):
+    """Enumeration of thread status types."""
+    RESOLVED = "Resolved"  # Answered by admin/staff
+    ENDORSED = "Endorsed"  # Student answer with endorsement
+    UNCONFIRMED = "Unconfirmed"  # Student answer without endorsement
+    PENDING = "Pending"  # No answers
 
 
 @dataclass
@@ -31,21 +41,33 @@ class ThreadEntry:
     subcategory: str
     subsubcategory: str
     created_at: datetime
+    status: ThreadStatus
     first_answer_at: Optional[datetime]
     response_delay: Optional[timedelta]
-    
-    @property
-    def is_answered(self) -> bool:
-        """Check if the question has been answered."""
-        return self.first_answer_at is not None
-    
+
+    def is_effectively_answered(self, count_unconfirmed: bool = False) -> bool:
+        """
+        Check if the question is effectively answered based on status.
+
+        Args:
+            count_unconfirmed: Whether to count unconfirmed answers as resolved
+
+        Returns:
+            True if the question should be considered answered
+        """
+        if self.status in [ThreadStatus.RESOLVED, ThreadStatus.ENDORSED]:
+            return True
+        elif self.status == ThreadStatus.UNCONFIRMED and count_unconfirmed:
+            return True
+        return False
+
     @property
     def response_delay_hours(self) -> Optional[float]:
         """Get response delay in hours."""
         if self.response_delay:
             return self.response_delay.total_seconds() / 3600
         return None
-    
+
     @property
     def category_path(self) -> str:
         """Get the full category path."""
@@ -57,22 +79,23 @@ class ThreadEntry:
         return "-".join(parts)
 
     def __str__(self) -> str:
-        delay_info = f"{self.response_delay_hours:.2f}h" if self.is_answered else "N/A"
-        return f"#{self.id:3d} >> {self.category_path:<30} : {delay_info}"
+        delay_info = f"{self.response_delay_hours:.2f}h" if self.first_answer_at else "N/A"
+        status_info = f"[{self.status.value}]"
+        return f"#{self.id:3d} >> {self.category_path:<30} : {delay_info:<8} {status_info}"
 
 
 class EdAnalyzer:
     """
     Main analyzer class for Ed Discussion SLO metrics.
     """
-    
+
     def __init__(self, json_file: str):
         """
         Initialize the analyzer with a JSON file.
         :param json_file: Path to the Ed Discussion JSON file.
         """
         self.threads = self._load_and_parse(json_file)
-    
+
     def _load_and_parse(self, json_file: str) -> List[ThreadEntry]:
         """
         Load and parse the JSON file into ThreadEntry objects.
@@ -86,16 +109,16 @@ class EdAnalyzer:
         except json.JSONDecodeError as e:
             print(f"Error: Invalid JSON format - {e}")
             sys.exit(1)
-        
+
         threads = []
         for item in data:
             if item.get('type') == 'question':
                 thread = self._parse_thread(item)
                 if thread:
                     threads.append(thread)
-        
+
         return threads
-    
+
     @staticmethod
     def _parse_thread(item: Dict[str, Any]) -> Optional[ThreadEntry]:
         """
@@ -104,137 +127,214 @@ class EdAnalyzer:
         try:
             # Parse created timestamp
             created_at = datetime.fromisoformat(item['created_at'])
-            
-            # Parse first answer timestamp if exists
-            first_answer_at = None
-            response_delay = None
-            
+
+            # Determine status and answer timestamp based on chronological order
             answers = item.get('answers', [])
-            if answers:
-                first_answer_created = answers[0]['created_at']
-                first_answer_at = datetime.fromisoformat(first_answer_created)
-                response_delay = first_answer_at - created_at
-            
+            status, first_answer_at, response_delay = EdAnalyzer._determine_thread_status(
+                answers, created_at
+            )
+
             return ThreadEntry(
                 id=item['number'],
                 category=item.get('category', ''),
                 subcategory=item.get('subcategory', ''),
                 subsubcategory=item.get('subsubcategory', ''),
                 created_at=created_at,
+                status=status,
                 first_answer_at=first_answer_at,
                 response_delay=response_delay
             )
-        
+
         except (KeyError, ValueError) as e:
             print(f"Warning: Skipping malformed thread - {e}")
             return None
-    
+
+    @staticmethod
+    def _determine_thread_status(answers: List[Dict[str, Any]], created_at: datetime) -> tuple:
+        """
+        Determine the thread status based on answers in chronological order.
+
+        Returns:
+            Tuple of (status, first_qualifying_answer_at, response_delay)
+        """
+        if not answers:
+            return ThreadStatus.PENDING, None, None
+
+        # Find the first qualifying answer (staff/admin or endorsed student answer)
+        first_qualifying_answer = None
+        final_status = ThreadStatus.UNCONFIRMED  # Default if only unconfirmed answers exist
+
+        for answer in answers:
+            user_role = answer.get('user', {}).get('role', '')
+            is_endorsed = answer.get('endorsed', False)
+
+            # Check if this answer qualifies (staff/admin or endorsed)
+            if user_role in ['admin', 'staff'] or is_endorsed:
+                first_qualifying_answer = answer
+                # Determine final status based on the presence of staff/admin answers
+                has_staff_answer = any(
+                    ans.get('user', {}).get('role', '') in ['admin', 'staff']
+                    for ans in answers
+                )
+                final_status = ThreadStatus.RESOLVED if has_staff_answer else ThreadStatus.ENDORSED
+                break
+
+        if first_qualifying_answer:
+            answer_time = datetime.fromisoformat(first_qualifying_answer['created_at'])
+            return (
+                final_status,
+                answer_time,
+                answer_time - created_at
+            )
+        else:
+            # Only unconfirmed answers exist, use first answer
+            first_answer = answers[0]
+            answer_time = datetime.fromisoformat(first_answer['created_at'])
+            return (
+                ThreadStatus.UNCONFIRMED,
+                answer_time,
+                answer_time - created_at
+            )
+
     def show_details(self) -> None:
         """
         Show detailed information for all question threads.
         """
         print("=== Question Thread Details ===\n")
-        
+
         for thread in self.threads:
             print(thread)
-        
+
         print(f"\nTotal questions analyzed: {len(self.threads)}")
-    
-    def show_week_stats(self, categorize: bool) -> None:
+
+    def show_week_stats(self, categorize: bool, count_unconfirmed: bool = False) -> None:
         """
         Show statistics for the last week.
         """
         now = datetime.now()
         week_ago = now - timedelta(days=7)
-        
+
         # Filter threads from last week
         week_threads = [
-            t for t in self.threads 
+            t for t in self.threads
             if t.created_at >= week_ago.replace(tzinfo=t.created_at.tzinfo)
         ]
-        
+
         print("=== Last Week Statistics ===\n")
-        self._show_statistics(week_threads, "last week")
+        self._show_statistics(week_threads, "last week", count_unconfirmed)
 
         if categorize:
-            self._show_category_breakdown(week_threads)
-    
-    def show_overall_stats(self, categorize: bool) -> None:
+            self._show_category_breakdown(week_threads, count_unconfirmed)
+
+    def show_overall_stats(self, categorize: bool, count_unconfirmed: bool = False) -> None:
         """
         Show overall statistics for all threads.
         """
         print("=== Overall Statistics ===\n")
-        self._show_statistics(self.threads, "overall")
+        self._show_statistics(self.threads, "overall", count_unconfirmed)
 
         if categorize:
-            self._show_category_breakdown(self.threads)
+            self._show_category_breakdown(self.threads, count_unconfirmed)
 
     @staticmethod
-    def _show_statistics(threads: List[ThreadEntry], period: str) -> None:
+    def _show_statistics(threads: List[ThreadEntry], period: str, count_unconfirmed: bool = False) -> None:
         """
         Show statistics for a given set of threads.
         """
         if not threads:
             print(f"No questions found for {period}.")
             return
-        
-        answered_threads = [t for t in threads if t.is_answered]
+
+        # Status breakdown
+        status_counts = {status: 0 for status in ThreadStatus}
+        for thread in threads:
+            status_counts[thread.status] += 1
+
+        # Effectively answered threads
+        answered_threads = [t for t in threads if t.is_effectively_answered(count_unconfirmed)]
 
         total_count = len(threads)
         answered_count = len(answered_threads)
 
         print(f"Period: {period.title()}")
         print(f"Total questions: {total_count}")
-        print(f"Answered questions: {answered_count} ({answered_count/total_count*100:.1f}%)")
+        print()
+        print("Status Breakdown:")
+        print(f"  Resolved (by staff/admin): {status_counts[ThreadStatus.RESOLVED]}")
+        print(f"  Endorsed (student with endorsement): {status_counts[ThreadStatus.ENDORSED]}")
+        print(f"  Unconfirmed (student replied): {status_counts[ThreadStatus.UNCONFIRMED]}")
+        print(f"  Pending (no answers): {status_counts[ThreadStatus.PENDING]}")
+        print()
+
+        unconfirmed_note = " (including unconfirmed)" if count_unconfirmed else ""
+        print(f"Effectively answered{unconfirmed_note}: {answered_count} ({answered_count / total_count * 100:.1f}%)")
 
         if answered_threads:
-            response_times = [t.response_delay_hours for t in answered_threads]
-            
-            print(f"\n--- Response Time Analysis ---")
-            print(f"Average response time: {mean(response_times):.2f} hours")
-            print(f"Median response time: {median(response_times):.2f} hours")
-            print(f"Fastest response: {min(response_times):.2f} hours")
-            print(f"Slowest response: {max(response_times):.2f} hours")
-            
-            # SLO metrics
-            within_6h = sum(1 for t in response_times if t <= 6)
-            within_24h = sum(1 for t in response_times if t <= 24)
-            within_48h = sum(1 for t in response_times if t <= 48)
-            
-            print(f"\n--- SLO Metrics ---")
-            print(f"Answered within 6 hour: {within_6h}/{answered_count} ({within_6h/answered_count*100:.1f}%)")
-            print(f"Answered within 24 hours: {within_24h}/{answered_count} ({within_24h/answered_count*100:.1f}%)")
-            print(f"Answered within 48 hours: {within_48h}/{answered_count} ({within_48h/answered_count*100:.1f}%)")
-    
+            response_times = [t.response_delay_hours for t in answered_threads if t.response_delay_hours is not None]
+
+            if response_times:
+                print(f"\n--- Response Time Analysis ---")
+                print(f"Average response time: {mean(response_times):.2f} hours")
+                print(f"Median response time: {median(response_times):.2f} hours")
+                print(f"Fastest response: {min(response_times):.2f} hours")
+                print(f"Slowest response: {max(response_times):.2f} hours")
+
+                # SLO metrics
+                within_6h = sum(1 for t in response_times if t <= 6)
+                within_24h = sum(1 for t in response_times if t <= 24)
+                within_48h = sum(1 for t in response_times if t <= 48)
+
+                print(f"\n--- SLO Metrics ---")
+                print(f"Answered within 6 hour: {within_6h}/{answered_count} ({within_6h / answered_count * 100:.1f}%)")
+                print(
+                    f"Answered within 24 hours: {within_24h}/{answered_count} ({within_24h / answered_count * 100:.1f}%)")
+                print(
+                    f"Answered within 48 hours: {within_48h}/{answered_count} ({within_48h / answered_count * 100:.1f}%)")
+
     @staticmethod
-    def _show_category_breakdown(threads: List[ThreadEntry]) -> None:
+    def _show_category_breakdown(threads: List[ThreadEntry], count_unconfirmed: bool = False) -> None:
         """
         Show breakdown by category.
         """
         category_stats = {}
-        
+
         for thread in threads:
             category = thread.category_path
             if category not in category_stats:
-                category_stats[category] = {'total': 0, 'answered': 0, 'response_times': []}
-            
+                category_stats[category] = {
+                    'total': 0,
+                    'answered': 0,
+                    'response_times': [],
+                    'status_counts': {status: 0 for status in ThreadStatus}
+                }
+
             category_stats[category]['total'] += 1
-            if thread.is_answered:
+            category_stats[category]['status_counts'][thread.status] += 1
+
+            if thread.is_effectively_answered(count_unconfirmed):
                 category_stats[category]['answered'] += 1
-                category_stats[category]['response_times'].append(thread.response_delay_hours)
-        
+                if thread.response_delay_hours is not None:
+                    category_stats[category]['response_times'].append(thread.response_delay_hours)
+
         if category_stats:
-            print(f"\n--- Category Breakdown ---")
+            unconfirmed_note = " (including unconfirmed)" if count_unconfirmed else ""
+            print(f"\n--- Category Breakdown{unconfirmed_note} ---")
             for category, stats in sorted(category_stats.items()):
                 total = stats['total']
                 answered = stats['answered']
                 answer_rate = answered / total * 100 if total > 0 else 0
-                
+
                 avg_time = "N/A"
                 if stats['response_times']:
                     avg_time = f"{mean(stats['response_times']):.2f}h"
-                
+
+                resolved = stats['status_counts'][ThreadStatus.RESOLVED]
+                endorsed = stats['status_counts'][ThreadStatus.ENDORSED]
+                unconfirmed = stats['status_counts'][ThreadStatus.UNCONFIRMED]
+                pending = stats['status_counts'][ThreadStatus.PENDING]
+
                 print(f"{category:<30}: {answered:3d}/{total:3d} ({answer_rate:.1f}%) - Avg: {avg_time}")
+                print(f"{'':32}  [R:{resolved} E:{endorsed} U:{unconfirmed} P:{pending}]")
 
 
 """Main entry point for the CLI application."""
@@ -246,15 +346,15 @@ if __name__ == '__main__':
 Examples:
     python ed_slo_analyzer.py data.json --mode details
     python ed_slo_analyzer.py data.json --mode week --categorize
-    python ed_slo_analyzer.py data.json --mode overall
+    python ed_slo_analyzer.py data.json --mode overall --count-unconfirmed
         """
     )
-    
+
     parser.add_argument(
         'json_file',
         help='Path to the Ed Discussion JSON file'
     )
-    
+
     parser.add_argument(
         '-m', '--mode',
         choices=['details', 'week', 'overall'],
@@ -268,19 +368,26 @@ Examples:
         default=False,
         help='Show breakdown by category (only for week and overall modes)'
     )
-    
+
+    parser.add_argument(
+        '-u', '--count-unconfirmed',
+        action='store_true',
+        default=False,
+        help='Count unconfirmed student answers as resolved (default: False)'
+    )
+
     args = parser.parse_args()
-    
+
     try:
         analyzer = EdAnalyzer(args.json_file)
-        
+
         if args.mode == 'details':
             analyzer.show_details()
         elif args.mode == 'week':
-            analyzer.show_week_stats(categorize=args.categorize)
+            analyzer.show_week_stats(categorize=args.categorize, count_unconfirmed=args.count_unconfirmed)
         else:  # overall
-            analyzer.show_overall_stats(categorize=args.categorize)
-            
+            analyzer.show_overall_stats(categorize=args.categorize, count_unconfirmed=args.count_unconfirmed)
+
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
         sys.exit(1)
