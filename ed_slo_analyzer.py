@@ -5,6 +5,9 @@ Ed Discussion SLO Analysis Tool
 This tool analyzes Ed Discussion JSON data to compute Service Level Objectives (SLO)
 for answering student questions.
 
+Author:
+    Alex Jiakai Xu <ax2155@columbia.edu>
+
 Usage:
     python ed_slo_analyzer.py <json_file> [options]
 
@@ -261,7 +264,7 @@ class EdAnalyzer:
         print()
         print("Status Breakdown:")
         print(f"  Resolved (by staff/admin): {status_counts[ThreadStatus.RESOLVED]}")
-        print(f"  Endorsed (student with endorsement): {status_counts[ThreadStatus.ENDORSED]}")
+        print(f"  Endorsed (student replied with endorsement): {status_counts[ThreadStatus.ENDORSED]}")
         print(f"  Unconfirmed (student replied): {status_counts[ThreadStatus.UNCONFIRMED]}")
         print(f"  Pending (no answers): {status_counts[ThreadStatus.PENDING]}")
         print()
