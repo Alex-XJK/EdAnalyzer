@@ -25,8 +25,8 @@ EdAnalyzer helps teaching assistants and course staff track their performance in
 # Show detailed view of all question threads
 python ed_slo_analyzer.py data.json --mode details
 
-# Show last week's statistics with category breakdown
-python ed_slo_analyzer.py data.json --mode week --categorize
+# Show last week's statistics with category breakdown and skip weekends posts
+python ed_slo_analyzer.py data.json --mode week --categorize --skip-weekends
 
 # Include unconfirmed student answers as resolved
 python ed_slo_analyzer.py data.json --mode overall --count-unconfirmed
@@ -34,12 +34,13 @@ python ed_slo_analyzer.py data.json --mode overall --count-unconfirmed
 
 ### Command Line Options
 
-| Option                            | Description                                   |
-|-----------------------------------|-----------------------------------------------|
-| `--mode {details\|week\|overall}` | Analysis mode (default: overall)              |
-| `--categorize`                    | Show breakdown by category                    |
-| `--count-unconfirmed`             | Count unconfirmed student answers as resolved |
-| `--help`                          | Show help message                             |
+| Option                            | Description                                          |
+|-----------------------------------|------------------------------------------------------|
+| `--mode {details\|week\|overall}` | Analysis mode (default: overall)                     |
+| `--categorize`                    | Show breakdown by category                           |
+| `--count-unconfirmed`             | Count unconfirmed student answers as resolved        |
+| `--skip-weekends`                 | Skip threads posted on weekends in statistical modes |
+| `--help`                          | Show help message                                    |
 
 ## Getting Your Ed Discussion Data
 

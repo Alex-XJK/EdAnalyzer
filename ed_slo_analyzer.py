@@ -15,17 +15,19 @@ Options:
     --mode {details|week|overall}  Analysis mode (default: overall)
     --categorize                   Show breakdown by category, only for week and overall modes
     --count-unconfirmed           Count unconfirmed student answers as resolved (default: False)
+    --skip-weekends               Skip threads posted on weekends in statistical modes (default: False)
     --help                        Show this help message
 """
 
-import json
 import argparse
+import json
 import sys
+import zoneinfo
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
-from statistics import mean, median
 from enum import Enum
+from statistics import mean, median
+from typing import List, Optional, Dict, Any
 
 
 class ThreadStatus(Enum):
@@ -65,6 +67,11 @@ class ThreadEntry:
         return False
 
     @property
+    def is_weekend_post(self) -> bool:
+        """Check if the thread was posted on weekend (Saturday=5, Sunday=6)."""
+        return self.created_at.weekday() >= 5
+
+    @property
     def response_delay_hours(self) -> Optional[float]:
         """Get response delay in hours."""
         if self.response_delay:
@@ -83,14 +90,18 @@ class ThreadEntry:
 
     def __str__(self) -> str:
         delay_info = f"{self.response_delay_hours:.2f}h" if self.first_answer_at else "N/A"
+        weekend_annotation = "(W)" if self.is_weekend_post else ""
         status_info = f"[{self.status.value}]"
-        return f"#{self.id:3d} >> {self.category_path:<30} : {delay_info:<8} {status_info}"
+        return f"#{self.id:3d} >> {self.category_path:<30} : {delay_info:<8} {weekend_annotation:<4} {status_info}"
 
 
 class EdAnalyzer:
     """
     Main analyzer class for Ed Discussion SLO metrics.
     """
+
+    # New York timezone for all timestamp conversions
+    DEFAULT_TZ = zoneinfo.ZoneInfo("America/New_York")
 
     def __init__(self, json_file: str):
         """
@@ -128,8 +139,9 @@ class EdAnalyzer:
         Parse a single thread item into a ThreadEntry object.
         """
         try:
-            # Parse created timestamp
-            created_at = datetime.fromisoformat(item['created_at'])
+            # Parse created timestamp and convert to NY time
+            created_at_original = datetime.fromisoformat(item['created_at'])
+            created_at = created_at_original.astimezone(EdAnalyzer.DEFAULT_TZ)
 
             # Determine status and answer timestamp based on chronological order
             answers = item.get('answers', [])
@@ -183,7 +195,8 @@ class EdAnalyzer:
                 break
 
         if first_qualifying_answer:
-            answer_time = datetime.fromisoformat(first_qualifying_answer['created_at'])
+            answer_time_original = datetime.fromisoformat(first_qualifying_answer['created_at'])
+            answer_time = answer_time_original.astimezone(EdAnalyzer.DEFAULT_TZ)
             return (
                 final_status,
                 answer_time,
@@ -192,12 +205,30 @@ class EdAnalyzer:
         else:
             # Only unconfirmed answers exist, use first answer
             first_answer = answers[0]
-            answer_time = datetime.fromisoformat(first_answer['created_at'])
+            answer_time_original = datetime.fromisoformat(first_answer['created_at'])
+            answer_time = answer_time_original.astimezone(EdAnalyzer.DEFAULT_TZ)
             return (
                 ThreadStatus.UNCONFIRMED,
                 answer_time,
                 answer_time - created_at
             )
+
+    @staticmethod
+    def _filter_threads(threads: List[ThreadEntry], skip_weekends: bool = False) -> List[ThreadEntry]:
+        """
+        Filter threads based on criteria.
+
+        Args:
+            threads: List of threads to filter
+            skip_weekends: Whether to skip threads posted on weekends
+
+        Returns:
+            Filtered list of threads
+        """
+        if not skip_weekends:
+            return threads
+
+        return [t for t in threads if not t.is_weekend_post]
 
     def show_details(self) -> None:
         """
@@ -210,34 +241,50 @@ class EdAnalyzer:
 
         print(f"\nTotal questions analyzed: {len(self.threads)}")
 
-    def show_week_stats(self, categorize: bool, count_unconfirmed: bool = False) -> None:
+    def show_week_stats(self, categorize: bool, count_unconfirmed: bool = False, skip_weekends: bool = False) -> None:
         """
         Show statistics for the last week.
         """
-        now = datetime.now()
+        # Use NY time for "now" and week calculation
+        now = datetime.now(EdAnalyzer.DEFAULT_TZ)
         week_ago = now - timedelta(days=7)
 
         # Filter threads from last week
         week_threads = [
             t for t in self.threads
-            if t.created_at >= week_ago.replace(tzinfo=t.created_at.tzinfo)
+            if t.created_at >= week_ago
         ]
 
+        # Apply weekend filtering
+        filtered_threads = self._filter_threads(week_threads, skip_weekends)
+
         print("=== Last Week Statistics ===\n")
-        self._show_statistics(week_threads, "last week", count_unconfirmed)
+        if skip_weekends and len(filtered_threads) != len(week_threads):
+            skipped_count = len(week_threads) - len(filtered_threads)
+            print(f"Note: Skipped {skipped_count} weekend posts from analysis.")
+
+        self._show_statistics(filtered_threads, "last week", count_unconfirmed)
 
         if categorize:
-            self._show_category_breakdown(week_threads, count_unconfirmed)
+            self._show_category_breakdown(filtered_threads, count_unconfirmed)
 
-    def show_overall_stats(self, categorize: bool, count_unconfirmed: bool = False) -> None:
+    def show_overall_stats(self, categorize: bool, count_unconfirmed: bool = False,
+                           skip_weekends: bool = False) -> None:
         """
         Show overall statistics for all threads.
         """
+        # Apply weekend filtering
+        filtered_threads = self._filter_threads(self.threads, skip_weekends)
+
         print("=== Overall Statistics ===\n")
-        self._show_statistics(self.threads, "overall", count_unconfirmed)
+        if skip_weekends and len(filtered_threads) != len(self.threads):
+            skipped_count = len(self.threads) - len(filtered_threads)
+            print(f"Note: Skipped {skipped_count} weekend posts from analysis.")
+
+        self._show_statistics(filtered_threads, "overall", count_unconfirmed)
 
         if categorize:
-            self._show_category_breakdown(self.threads, count_unconfirmed)
+            self._show_category_breakdown(filtered_threads, count_unconfirmed)
 
     @staticmethod
     def _show_statistics(threads: List[ThreadEntry], period: str, count_unconfirmed: bool = False) -> None:
@@ -264,8 +311,8 @@ class EdAnalyzer:
         print()
         print("Status Breakdown:")
         print(f"  Resolved (by staff/admin): {status_counts[ThreadStatus.RESOLVED]}")
-        print(f"  Endorsed (student replied with endorsement): {status_counts[ThreadStatus.ENDORSED]}")
-        print(f"  Unconfirmed (student replied): {status_counts[ThreadStatus.UNCONFIRMED]}")
+        print(f"  Endorsed (student + endorsed): {status_counts[ThreadStatus.ENDORSED]}")
+        print(f"  Unconfirmed (student only): {status_counts[ThreadStatus.UNCONFIRMED]}")
         print(f"  Pending (no answers): {status_counts[ThreadStatus.PENDING]}")
         print()
 
@@ -288,7 +335,7 @@ class EdAnalyzer:
                 within_48h = sum(1 for t in response_times if t <= 48)
 
                 print(f"\n--- SLO Metrics ---")
-                print(f"Answered within 6 hour: {within_6h}/{answered_count} ({within_6h / answered_count * 100:.1f}%)")
+                print(f"Answered within 6 hours: {within_6h}/{answered_count} ({within_6h / answered_count * 100:.1f}%)")
                 print(
                     f"Answered within 24 hours: {within_24h}/{answered_count} ({within_24h / answered_count * 100:.1f}%)")
                 print(
@@ -348,7 +395,7 @@ if __name__ == '__main__':
         epilog="""
 Examples:
     python ed_slo_analyzer.py data.json --mode details
-    python ed_slo_analyzer.py data.json --mode week --categorize
+    python ed_slo_analyzer.py data.json --mode week --categorize --skip-weekends
     python ed_slo_analyzer.py data.json --mode overall --count-unconfirmed
         """
     )
@@ -379,6 +426,13 @@ Examples:
         help='Count unconfirmed student answers as resolved (default: False)'
     )
 
+    parser.add_argument(
+        '-s', '--skip-weekends',
+        action='store_true',
+        default=False,
+        help='Skip threads posted on weekends in statistical modes (default: False)'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -387,9 +441,17 @@ Examples:
         if args.mode == 'details':
             analyzer.show_details()
         elif args.mode == 'week':
-            analyzer.show_week_stats(categorize=args.categorize, count_unconfirmed=args.count_unconfirmed)
+            analyzer.show_week_stats(
+                categorize=args.categorize,
+                count_unconfirmed=args.count_unconfirmed,
+                skip_weekends=args.skip_weekends
+            )
         else:  # overall
-            analyzer.show_overall_stats(categorize=args.categorize, count_unconfirmed=args.count_unconfirmed)
+            analyzer.show_overall_stats(
+                categorize=args.categorize,
+                count_unconfirmed=args.count_unconfirmed,
+                skip_weekends=args.skip_weekends
+            )
 
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")
